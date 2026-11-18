@@ -71,6 +71,20 @@ const countTasks = (text) => {
   return { done, total };
 };
 
+// tasks.md → per-section task groups: checkbox bullets belong to the last
+// `##` (or deeper) heading, which is what the open section header collapses.
+const parseTasks = (text) => {
+  const sections = [];
+  let current = null;
+  for (const line of (text || "").split("\n")) {
+    const h = /^#{2,}\s+(.*)$/.exec(line);
+    const t = /^\s*[-*]\s*\[([ xX])\]\s*(.*)$/.exec(line);
+    if (h) { current = { title: h[1].trim(), tasks: [] }; sections.push(current); }
+    else if (t && current) current.tasks.push({ done: t[1].toLowerCase() === "x", text: t[2] });
+  }
+  return sections;
+};
+
 // Relative paths to a folder/file tree, folder order kept.
 function buildTree(paths) {
   const root = { dirs: new Map(), files: [] };
@@ -92,8 +106,31 @@ export default class OpenSpec extends View {
     this.context = null; this.openspec = null; this.root = null; this.on = null;
     this.open = null; this.base = null; this.file = null; this.code = null;
     this.error = null; this.fileError = null; this.loading = false; this.watched = null;
+    this.schema = null; this.specFiles = []; this.taskGroups = []; this.taskCollapsed = new Set(); this.hadTasks = false;
+    this.detailReady = false; this.detailSpinner = false;
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
+  }
+
+  // The project's configured schema name: the change's .openspec.yaml wins over
+  // openspec/config.yaml (or config.yml), and spec-driven is the default — the
+  // same order the OpenSpec CLI resolves it. Other dots in config are ignored.
+  async schemaLine(file, context) {
+    const text = await readTextFile(file, { on: this.on }).catch(() => null);
+    if (!this.current(context) || text === null) return null;
+    const m = /^schema:\s*["']?([^\s"']+)/m.exec(text);
+    return m ? m[1] : null;
+  }
+
+  async projectSchema(on, context) {
+    if (!this.openspec) return "spec-driven";
+    for (const n of ["config.yaml", "config.yml"]) {
+      const text = await readTextFile(`${this.openspec}/${n}`, { on }).catch(() => null);
+      if (text === null || !this.current(context)) continue;
+      const m = /^schema:\s*["']?([^\s"']+)/m.exec(text);
+      if (m && m[1]) return m[1];
+    }
+    return "spec-driven";
   }
 
   watch(dir, cx) {
@@ -121,6 +158,8 @@ export default class OpenSpec extends View {
       this.openspec = null; this.root = null; this.open = null; this.base = null; this.file = null;
       this.code?.release(); this.code = null;
       this.error = null; this.fileError = null; this.watched = null;
+      this.schema = null; this.specFiles = []; this.taskGroups = []; this.taskCollapsed = new Set(); this.hadTasks = false;
+      this.detailReady = false; this.detailSpinner = false;
       this.loading = false;
     }
     if (!cwd) return;
@@ -132,6 +171,7 @@ export default class OpenSpec extends View {
         if (!this.current(context)) return;
         this.openspec = openspec;
         this.root = openspec ? openspec.replace(/[/\\]openspec$/, "") : null;
+        this.schema = openspec ? await this.projectSchema(on, context) : null;
         const changes = [], specs = [];
         if (openspec) {
           const names = (await listDirs(`${openspec}/changes`, on)).filter((n) => n !== "archive");
@@ -159,6 +199,18 @@ export default class OpenSpec extends View {
     const files = await listFiles(base, this.on);
     if (!this.current(context) || !this.same(this.open, item)) return;
     this.base = base; this.files = files;
+    // Structured change detail reads from the change's own files: the specs
+    // tree (specs/<capability>/spec.md) and, for a change, the tasks.md groups
+    // and any schema it declares per-change.
+    this.specFiles = files.filter((f) => f.startsWith("specs/")).map((f) => f.slice("specs/".length));
+    if (item.kind === "change") {
+      const hadTasks = files.includes("tasks.md");
+      const text = hadTasks ? await readTextFile(`${base}/tasks.md`, { on: this.on }).catch(() => null) : null;
+      const meta = await this.schemaLine(`${base}/.openspec.yaml`, context);
+      if (!this.current(context) || !this.same(this.open, item)) return;
+      this.hadTasks = hadTasks; this.taskGroups = parseTasks(text);
+      if (meta) this.schema = meta;
+    }
   }
 
   openItem(kind, name, cx) {
@@ -167,10 +219,14 @@ export default class OpenSpec extends View {
     const item = { kind, name };
     this.open = item;
     const context = this.context;
+    // Suppress the empty-placeholder flash while the detail loads: nothing for
+    // the first 100 ms, then a spinner, both gone the moment content is ready.
+    this.detailReady = false; this.detailSpinner = false;
+    cx.timer.after(100, (cx) => { if (this.open === item && !this.detailReady) { this.detailSpinner = true; cx.notify(); } });
     cx.spawn(async (cx) => {
       try { await this.loadFiles(item, context); }
       catch (e) { if (this.current(context) && this.same(this.open, item)) this.error = String(e); }
-      finally { cx.notify(); }
+      finally { this.detailReady = true; cx.notify(); }
     });
     cx.notify();
   }
@@ -178,12 +234,17 @@ export default class OpenSpec extends View {
   closeItem() {
     this.open = null; this.base = null; this.files = []; this.file = null;
     this.code?.release(); this.code = null; this.fileError = null;
-    this.collapsed = new Set();
+    this.collapsed = new Set(); this.specFiles = []; this.taskGroups = []; this.taskCollapsed = new Set(); this.hadTasks = false;
+    this.detailReady = false; this.detailSpinner = false;
   }
 
   show(path, cx) {
     this.code?.release(); this.code = null; this.file = path; this.fileError = null;
-    if (!path || !cx) return;
+    // Navigating back to the list/detail has no async read to drive the
+    // repaint (every other show() ends in the read's `finally notify`);
+    // without this the released editor stays blank on screen until the next
+    // unrelated notify fires seconds later.
+    if (!path) { cx?.notify(); return; }
     const context = this.context, base = this.base, on = this.on, item = this.open;
     cx.spawn(async (cx) => {
       try {
@@ -209,7 +270,10 @@ export default class OpenSpec extends View {
       .child(div().text_size(11).text_color(complete ? t.done : t.muted).child(change.total ? `${change.done}/${change.total}` : "—"));
   }
 
-  rows(node, prefix, depth, out, t) {
+  // `base` prefixes the path passed to show() without changing what is drawn,
+  // so the specs tree can draw capabilities without a redundant specs/ wrapper
+  // and still preview the real (specs/<path>) file.
+  rows(node, prefix, depth, out, t, base = "") {
     for (const [name, child] of node.dirs) {
       const path = prefix ? `${prefix}/${name}` : name, collapsed = this.collapsed.has(path);
       out.push(h_flex().id(`os-dir-${path}`).h(28).flex_none().pl(8 + depth * 16).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover((s) => s.bg(t.hover))
@@ -217,13 +281,13 @@ export default class OpenSpec extends View {
         .child(svg(`mods/openspec/chevron-${collapsed ? "right" : "down"}.svg`).size(12).flex_none().text_color(t.dim))
         .child(svg("mods/openspec/folder.svg").size(14).flex_none().text_color(t.muted))
         .child(div().flex_1().min_w(0).truncate().child(name)));
-      if (!collapsed) this.rows(child, path, depth + 1, out, t);
+      if (!collapsed) this.rows(child, path, depth + 1, out, t, base);
     }
     for (const name of node.files) {
-      const path = prefix ? `${prefix}/${name}` : name;
+      const path = prefix ? `${prefix}/${name}` : name, real = base ? `${base}/${path}` : path;
       out.push(h_flex().id(`os-file-${path}`).h(28).flex_none().pl(8 + depth * 16).pr(8).gap(7).items_center().rounded(7).cursor_pointer()
-        .when(this.file === path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => this.show(path, cx))
+        .when(this.file === real, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
+        .on_click((_e, cx) => this.show(real, cx))
         .child(div().w(12).flex_none())
         .child(svg("mods/openspec/file.svg").size(14).flex_none().text_color(t.muted))
         .child(div().flex_1().min_w(0).truncate().child(name)));
@@ -270,16 +334,82 @@ export default class OpenSpec extends View {
           this.specs.map((s) => this.specRow(s, t)), t)));
   }
 
+  artifactRow(name, t) {
+    return h_flex().id(`os-artifact-${name}`).h(28).flex_none().pl(8).pr(8).gap(7).items_center().rounded(7).cursor_pointer()
+      .when(this.file === name, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => this.show(name, cx))
+      .child(svg("mods/openspec/file.svg").size(14).flex_none().text_color(t.muted))
+      .child(div().flex_1().min_w(0).truncate().child(name));
+  }
+
+  taskGroup(group, i, t) {
+    const done = group.tasks.filter((tk) => tk.done).length;
+    const complete = group.tasks.length > 0 && done === group.tasks.length;
+    const key = `${this.open.name}:${i}`, open = !this.taskCollapsed.has(key);
+    return v_flex().flex_none()
+      .child(h_flex().id(`os-task-${i}`).h(28).flex_none().pl(8).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover((s) => s.bg(t.hover))
+        .on_click((_e, cx) => { if (open) this.taskCollapsed.add(key); else this.taskCollapsed.delete(key); cx.notify(); })
+        .child(svg(`mods/openspec/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim))
+        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(group.title))
+        .child(div().text_size(11).text_color(complete ? t.done : t.dim).child(group.tasks.length ? `${done}/${group.tasks.length}` : "")))
+      .when(open && group.tasks.length, (el) => el.child(v_flex().flex_none().children(group.tasks.map((tk, j) => this.taskLine(tk, j, t)))));
+  }
+
+  taskLine(task, i, t) {
+    return h_flex().id(`os-taskline-${i}`).h(24).flex_none().pl(31).pr(8).gap(7).items_center()
+      .child(div().w(12).flex_none().text_size(12).text_color(task.done ? t.done : t.muted).child(task.done ? "\u2713" : "\u25CB"))
+      .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(task.done ? t.dim : t.foreground).child(task.text));
+  }
+
+  // The structured spec-driven change detail: the change's own documents as
+  // two plain lines, then a Task and a Specs section each under a full-width
+  // band exactly like the change-name strip at the top of the detail.
+  detailSections(t) {
+    const has = (f) => this.files.includes(f);
+    const band = (label, right) => h_flex().flex_none().px(14).py(8).gap(8).items_center().border_t(1).border_b(1).border_color(t.border)
+      .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(label))
+      .child(right || div().flex_none());
+    const placeholder = (text) => div().px(8).py(2).text_size(12).text_color(t.dim).child(text);
+    const out = [];
+    // Proposal and Design: just the two document lines, no headers of their own.
+    if (has("proposal.md")) out.push(this.artifactRow("proposal.md", t)); else out.push(placeholder("No proposal"));
+    if (has("design.md")) out.push(this.artifactRow("design.md", t)); else out.push(placeholder("No design"));
+    // Tasks: its own band (the change strip already carries the progress
+    // badge, so the Tasks header itself stays label-only), then the groups.
+    out.push(band("Tasks"));
+    if (this.taskGroups.length) out.push(v_flex().flex_none().children(this.taskGroups.map((g, i) => this.taskGroup(g, i, t))));
+    else out.push(placeholder(this.hadTasks ? "No tracked sections" : "No tasks"));
+    // Specs: a similar full-width band, then the capabilities tree.
+    out.push(band("Specs", div().text_size(11).text_color(t.dim).child(String(this.specFiles.length))));
+    if (this.specFiles.length) out.push(v_flex().flex_none().children(this.rows(buildTree(this.specFiles), "", 0, [], t, "specs")));
+    else out.push(placeholder("No specs"));
+    return v_flex().children(out);
+  }
+
   detailBody(t) {
     const item = this.open, change = item.kind === "change" ? this.changes.find((c) => c.name === item.name) : null;
+    // The structured detail is the spec-driven view; other configured schemas
+    // keep the plain files tree.
+    const structured = item.kind === "change" && this.schema === "spec-driven";
     const tree = buildTree(this.files);
+    const ready = this.detailReady;
     return v_flex().flex_1().min_h(0)
       .when(Boolean(change), (el) => el.child(h_flex().flex_none().px(14).py(8).gap(8).items_center().border_b(1).border_color(t.border)
-        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child("Tasks"))
+        .child(div().flex_1().min_w(0).truncate().font_semibold().text_size(13).text_color(t.foreground).child(change.name))
         .child(this.badge(change, t))))
-      .child(v_flex().id("os-files").flex_1().min_h(0).overflow_y_scrollbar().p(6)
-        .children(this.rows(tree, "", 0, [], t))
-        .when(!this.files.length, (el) => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || "No files"))));
+      .when(!ready, (el) => el.child(this.detailSpinner ? this.loadingDetail(t) : v_flex().flex_1()))
+      .when(ready, (el) => el.child(v_flex().id("os-files").flex_1().min_h(0).overflow_y_scrollbar().p(6)
+        .when(structured, (e2) => e2.child(this.detailSections(t)))
+        .when(!structured, (e2) => e2.children(this.rows(tree, "", 0, [], t))
+          .when(!this.files.length, (e3) => e3.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || "No files"))))));
+  }
+
+  // Shown only after the 100 ms grace (see openItem) so a fast load never
+  // flashes a spinner. Native frames — no timer, no per-frame rerender.
+  loadingDetail(t) {
+    return v_flex().flex_1().items_center().justify_center().gap(10)
+      .child(div().text_size(14).text_color(t.muted).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90))
+      .child(div().text_size(12).text_color(t.dim).child("Loading…"));
   }
 
   render(cx) {
