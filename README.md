@@ -9,7 +9,7 @@ A side panel for [Herdr](https://herdr.dev) that shows the [OpenSpec](https://gi
 - Lists every active change under `openspec/changes/` with its task completion as `done/total` (read from each change's `tasks.md`).
 - Lists the capabilities under `openspec/specs/`.
 - A draggable divider splits the two sections.
-- Click a change to see a structured detail view shaped by the project's configured schema (`openspec/config.yaml`, `spec-driven` by default); click a spec to see the files it carries. Either way, click a file to read it inline with syntax highlighting.
+- Click a change to see a structured detail view shaped by the project's configured schema (`openspec/config.yaml`, `spec-driven` by default); click a spec to see the files it carries. Either way, click a file to read it inline: Markdown files (`proposal.md`, `design.md`, `spec.md`, `tasks.md`, …) render as formatted prose — headings, lists, quotes, code blocks, tables, task checkboxes, links — while every other file opens in a read-only syntax-highlighted editor.
 - Follows the focused pane's folder, local or remote, so it tracks whatever repo you're working in.
 
 It sits beside Herdr's own Files and Changes panels, with its own **OpenSpec** button in the tab bar.

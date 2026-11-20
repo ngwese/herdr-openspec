@@ -2,7 +2,7 @@
 // changes over specs with a draggable divider; open either to browse the files
 // it carries and preview them like the Files panel does.
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, v_resizable, resizable_panel } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, TextView, v_resizable, resizable_panel } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings } from "herdr";
 
 // The same folder rule as the Files and Changes panels: the focused pane's
@@ -15,6 +15,9 @@ function location() {
 }
 const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
+// Markdown artifacts (proposal/design/spec/tasks/…) render as prose instead of
+// raw text; every other file keeps the read-only syntax-highlighted Editor.
+const isMarkdown = (path) => /\.(md|markdown|mdx)$/i.test(path);
 
 // Walks up from cwd to the nearest openspec/changes and prints its openspec
 // folder; prints nothing when the repo has none.
@@ -104,7 +107,7 @@ export default class OpenSpec extends View {
   init(_props, cx) {
     this.changes = []; this.specs = []; this.files = []; this.collapsed = new Set();
     this.context = null; this.openspec = null; this.root = null; this.on = null;
-    this.open = null; this.base = null; this.file = null; this.code = null;
+    this.open = null; this.base = null; this.file = null; this.code = null; this.markdown = null;
     this.error = null; this.fileError = null; this.loading = false; this.watched = null;
     this.schema = null; this.specFiles = []; this.taskGroups = []; this.taskCollapsed = new Set(); this.hadTasks = false;
     this.detailReady = false; this.detailSpinner = false;
@@ -156,7 +159,7 @@ export default class OpenSpec extends View {
       this.context = { key: next, cwd, on };
       this.changes = []; this.specs = []; this.files = []; this.collapsed = new Set();
       this.openspec = null; this.root = null; this.open = null; this.base = null; this.file = null;
-      this.code?.release(); this.code = null;
+      this.code?.release(); this.code = null; this.markdown = null;
       this.error = null; this.fileError = null; this.watched = null;
       this.schema = null; this.specFiles = []; this.taskGroups = []; this.taskCollapsed = new Set(); this.hadTasks = false;
       this.detailReady = false; this.detailSpinner = false;
@@ -233,13 +236,13 @@ export default class OpenSpec extends View {
 
   closeItem() {
     this.open = null; this.base = null; this.files = []; this.file = null;
-    this.code?.release(); this.code = null; this.fileError = null;
+    this.code?.release(); this.code = null; this.markdown = null; this.fileError = null;
     this.collapsed = new Set(); this.specFiles = []; this.taskGroups = []; this.taskCollapsed = new Set(); this.hadTasks = false;
     this.detailReady = false; this.detailSpinner = false;
   }
 
   show(path, cx) {
-    this.code?.release(); this.code = null; this.file = path; this.fileError = null;
+    this.code?.release(); this.code = null; this.markdown = null; this.file = path; this.fileError = null;
     // Navigating back to the list/detail has no async read to drive the
     // repaint (every other show() ends in the read's `finally notify`);
     // without this the released editor stays blank on screen until the next
@@ -252,9 +255,11 @@ export default class OpenSpec extends View {
         if (this.file !== path || !this.same(this.open, item) || !this.current(context)) return;
         if (text === null) { this.fileError = "This file is no longer available"; return; }
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
+        const truncated = text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text;
+        if (isMarkdown(path)) { this.markdown = truncated; return; }
         const t = theme(), ext = path.includes(".") ? path.split(".").pop() : "txt";
         this.code = EditorState.new({ language: LANG[ext] ?? ext, readonly: true,
-          value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
+          value: truncated,
           font_family: settings().font_family, font_size: 12,
           syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
       } catch { if (this.file === path && this.same(this.open, item) && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
@@ -423,7 +428,11 @@ export default class OpenSpec extends View {
         .when(Boolean(this.file) || Boolean(this.open), (el) => el.child(div().id("openspec-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => back(cx)).child("←")))
         .child(div().font_semibold().child("OpenSpec"))
         .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(crumbs.join(" / "))))
-      .when(Boolean(this.file), (el) => el.child(this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")))
+      .when(Boolean(this.file), (el) => el.child(
+        this.markdown !== null
+          ? v_flex().id("os-markdown").flex_1().min_h(0).overflow_y_scrollbar().px(14).py(10).text_color(t.foreground)
+              .child(TextView.markdown(`os-md-${this.file}`, this.markdown).selectable(true))
+          : this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")))
       .when(!this.file && Boolean(this.open), (el) => el.child(this.detailBody(t)))
       .when(!this.file && !this.open, (el) => el.child(this.listBody(t)));
   }
